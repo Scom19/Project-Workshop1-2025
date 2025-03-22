@@ -29,7 +29,10 @@
     Структурирование результатов:
     
     results_crop/
-      ├── <класс_животного>/ |
-      │   └── <название_видео>/
-      │       ├── frame_000123_det_001.jpg
-      │       └── ...
+      ├── Alces/
+      │   ├── video1_frame_000001_det_000.jpg
+      │   ├── video1_frame_000002_det_001.jpg
+      │   └── video2_frame_000005_det_000.jpg
+      └── Bison/
+          ├── video3_frame_000010_det_000.jpg
+          └── video4_frame_000015_det_001.jpg
