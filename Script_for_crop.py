@@ -2,13 +2,27 @@ import os
 import json
 import cv2
 from PIL import Image
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
+import threading
 
 CONFIDENCE_THRESHOLD = 0.5  # Порог уверенности для детекций
+IOU_THRESHOLDS = {
+    'Bison': 0.6,
+    'Sus': 0.6,
+    'Capreolus': 0.65,
+    'Nyctereutes': 0.65,
+}
+DEFAULT_IOU_THRESHOLD = 0.7
+MIN_SIZE_FOR = {
+    'Bison': 0.06,
+    'Sus': 0.06,
+}
+DEFAULT_MIN_SIZE_RATIO = 0.04
 VIDEO_EXTENSIONS = ('.mp4', '.avi', '.mov')
 MAX_WORKERS = os.cpu_count() // 2
 MIN_INTERVAL_SECONDS = 0.5  # Минимальный интервал между кадрами в секундах
+MAX_HISTORY_SIZE = 150
 
 
 class VideoCache:
@@ -29,93 +43,106 @@ class VideoCache:
         print(f"Кеш построен. Найдено видео: {len(self.cache)}")
 
 
-def get_animal_class(json_path):
-    """Извлекает название класса из структуры папок"""
-    parent_dir = os.path.dirname(json_path)
-    return os.path.basename(parent_dir).replace("_json", "")
+class CropHistory:
+    """Класс для отслеживания истории вырезанных объектов для исключения дубликатов"""
+    def __init__(self):
+        self.history = {}
+        self.lock = threading.Lock()
+
+    def add_crop(self, animal_class, x_center_rel, y_center_rel, crop_w_rel, crop_h_rel):
+        # Сохранение параметров кропа с ограничением максимального размера истории
+        with self.lock:
+            if animal_class not in self.history:
+                self.history[animal_class] = []
+
+            self.history[animal_class].append({
+                'x_center_rel': x_center_rel,
+                'y_center_rel': y_center_rel,
+                'crop_w_rel': crop_w_rel,
+                'crop_h_rel': crop_h_rel
+            })
+
+            if len(self.history[animal_class]) > MAX_HISTORY_SIZE:
+                self.history[animal_class].pop(0)
+
+    def calculate_iou(self, box1, box2):
+        """Вычисление метрики IoU для двух боксов"""
+        box1_x1 = box1[0] - box1[2] / 2
+        box1_y1 = box1[1] - box1[3] / 2
+        box1_x2 = box1[0] + box1[2] / 2
+        box1_y2 = box1[1] + box1[3] / 2
+
+        box2_x1 = box2[0] - box2[2] / 2
+        box2_y1 = box2[1] - box2[3] / 2
+        box2_x2 = box2[0] + box2[2] / 2
+        box2_y2 = box2[1] + box2[3] / 2
+
+        x_left = max(box1_x1, box2_x1)
+        y_top = max(box1_y1, box2_y1)
+        x_right = min(box1_x2, box2_x2)
+        y_bottom = min(box1_y2, box2_y2)
+
+        if x_right < x_left or y_bottom < y_top:
+            return 0.0
+
+        intersection_area = (x_right - x_left) * (y_bottom - y_top)
+        area1 = box1[2] * box1[3]
+        area2 = box2[2] * box2[3]
+
+        return intersection_area / (area1 + area2 - intersection_area) if (area1 + area2 - intersection_area) > 0 else 0
+
+    def is_new_crop(self, animal_class, current_box):
+        # Сравнение с историей кропов для данного класса животных
+        with self.lock:
+            if animal_class not in self.history:
+                return True
+
+            iou_threshold = IOU_THRESHOLDS.get(animal_class, DEFAULT_IOU_THRESHOLD)
+
+            for stored in self.history[animal_class]:
+                stored_box = (
+                    stored['x_center_rel'],
+                    stored['y_center_rel'],
+                    stored['crop_w_rel'],
+                    stored['crop_h_rel']
+                )
+                iou = self.calculate_iou(current_box, stored_box)
+                if iou > iou_threshold:
+                    return False
+            return True
 
 
-def process_json(json_path, video_cache, output_root):
-    """Обработка JSON с использованием кешированных видео"""
-    total_saved = 0
-    try:
-        with open(json_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-    except Exception as e:
-        print(f"Ошибка чтения JSON {json_path}: {str(e)}")
-        return
-
-    animal_cls = get_animal_class(json_path)
-    output_folder = os.path.join(output_root, animal_cls)
-    os.makedirs(output_folder, exist_ok=True)
-
-    json_basename = os.path.splitext(os.path.basename(json_path))[0].lower()
-    video_path = video_cache.cache.get(json_basename)
-
-    if not video_path:
-        print(f"Видео для {json_basename} не найдено")
-        return
-
-    try:
-        cap = cv2.VideoCapture(video_path)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 100)
-        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        video_name = os.path.splitext(os.path.basename(video_path))[0]
-
-        frame_data = []
-        for frame_key, frame_info in data.get('file', {}).items():
-            try:
-                frame_number = int(os.path.splitext(frame_info.split('_')[-1])[0])
-                if 0 <= frame_number < frame_count:
-                    detections = data['detections'].get(frame_key, [])
-                    if any(d.get('conf', 0) >= CONFIDENCE_THRESHOLD for d in detections):
-                        frame_data.append((frame_number, frame_key))
-            except:
-                continue
-
-        frame_data.sort()
-
-        for frame_number, frame_key in frame_data:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
-            ret, frame = cap.read()
-            if not ret:
-                continue
-
-            detections = [(i, d) for i, d in enumerate(data['detections'][frame_key])
-                          if d.get('conf', 0) >= CONFIDENCE_THRESHOLD]
-
-            with ThreadPoolExecutor(max_workers=4) as executor:
-                results = list(executor.map(
-                    lambda item: process_detection(
-                        detection=item[1],
-                        frame=frame,
-                        frame_number=frame_number,
-                        output_folder=output_folder,
-                        video_name=video_name,
-                        det_idx=item[0]
-                    ),
-                    detections
-                ))
-                total_saved += sum(results)
-
-        print(f"\n{video_name}:")
-        print(f"Всего кадров в видео: {frame_count}")
-        print(f"Кадров с детекциями: {len(frame_data)}")
-        print(f"Сохранено объектов: {total_saved}")
-
-    except Exception as e:
-        print(f"Ошибка: {str(e)}")
-    finally:
-        cap.release()
-
-
-def process_detection(detection, frame, frame_number, output_folder, video_name, det_idx):
+def save_detection(detection, frame, output_dir, video_name,
+                   frame_num, det_idx, animal_class, crop_history):
+    """1. Преобразование относительных координат в абсолютные
+    2. Проверка минимальных размеров и соотношения сторон
+    3. Проверка уникальности через историю кропов
+    4. Сохранение изображения при выполнении всех условий"""
     try:
         h, w = frame.shape[:2]
-        x = int(detection['bbox'][0] * w)
-        y = int(detection['bbox'][1] * h)
-        crop_w = min(int(detection['bbox'][2] * w), w - x)
-        crop_h = min(int(detection['bbox'][3] * h), h - y)
+
+        x_center_rel = detection['bbox'][0] + detection['bbox'][2] / 2
+        y_center_rel = detection['bbox'][1] + detection['bbox'][3] / 2
+        crop_w_rel = detection['bbox'][2]
+        crop_h_rel = detection['bbox'][3]
+
+        if crop_w_rel <= 0 or crop_h_rel <= 0:
+            return 0
+
+        min_size_ratio = MIN_SIZE_FOR.get(animal_class, DEFAULT_MIN_SIZE_RATIO)
+        if crop_w_rel < min_size_ratio or crop_h_rel < min_size_ratio:
+            return 0
+
+        x = int((x_center_rel - crop_w_rel / 2) * w)
+        y = int((y_center_rel - crop_h_rel / 2) * h)
+        crop_w = int(crop_w_rel * w)
+        crop_h = int(crop_h_rel * h)
+        if max(crop_w, crop_h) / min(crop_w, crop_h) >= 5:
+            return 0
+        x = max(0, x)
+        y = max(0, y)
+        crop_w = min(crop_w, w - x)
+        crop_h = min(crop_h, h - y)
 
         if crop_w <= 0 or crop_h <= 0:
             return 0
@@ -124,20 +151,98 @@ def process_detection(detection, frame, frame_number, output_folder, video_name,
         if crop.size == 0:
             return 0
 
-        output_filename = (
-            f"{video_name}_"
-            f"frame_{frame_number:08d}_"
-            f"det_{det_idx:03d}_"
-            f"conf_{detection['conf']:.2f}.jpg"
-        )
-        output_path = os.path.join(output_folder, output_filename)
+        current_box = (x_center_rel, y_center_rel, crop_w_rel, crop_h_rel)
+        is_new = crop_history.is_new_crop(animal_class, current_box)
 
-        Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)).save(output_path)
-        return 1
+        if is_new:
+            filename = f"{video_name}_f{frame_num:08d}_d{det_idx:03d}_c{detection['conf']:.2f}.jpg"
+            output_path = os.path.join(output_dir, filename)
+            Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)).save(output_path)
+            crop_history.add_crop(
+                animal_class,
+                x_center_rel,
+                y_center_rel,
+                crop_w_rel,
+                crop_h_rel
+            )
+            return 1
+        return 0
+    except Exception as e:
+        print(f"Ошибка сохранения: {str(e)}")
+        return 0
+
+
+def process_json(json_path, video_cache, output_root, crop_history):
+    try:
+        with open(json_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except Exception as e:
+        print(f"Ошибка чтения {json_path}: {str(e)}")
+        return
+
+    animal_class = os.path.basename(os.path.dirname(json_path)).replace("_json", "")
+    output_dir = os.path.join(output_root, animal_class)
+    os.makedirs(output_dir, exist_ok=True)
+
+    video_name = os.path.splitext(os.path.basename(json_path))[0].lower()
+    video_path = video_cache.cache.get(video_name)
+    if not video_path:
+        print(f"Видео для {video_name} не найдено")
+        return
+
+    try:
+        cap = cv2.VideoCapture(video_path)
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        min_frame_interval = max(1, int(fps * MIN_INTERVAL_SECONDS))
+        candidates = []
+
+        for frame_key, frame_info in data.get('file', {}).items():
+            try:
+                frame_num = int(os.path.splitext(frame_info.split('_')[-1])[0])
+                if 0 <= frame_num < frame_count:
+                    detections = [d for d in data['detections'].get(frame_key, [])
+                                  if d.get('conf', 0) >= CONFIDENCE_THRESHOLD]
+                    if detections:
+                        candidates.append((frame_num, frame_key))
+            except:
+                continue
+
+        total_saved = 0
+        for fn, fk in candidates[::min_frame_interval]:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, fn)
+            ret, frame = cap.read()
+            if not ret:
+                continue
+
+            detections = [d for d in data['detections'].get(fk, [])
+                          if d.get('conf', 0) >= CONFIDENCE_THRESHOLD]
+
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                futures = []
+                for idx, det in enumerate(detections):
+                    futures.append(
+                        executor.submit(
+                            save_detection,
+                            det,
+                            frame,
+                            output_dir,
+                            video_name,
+                            fn,
+                            idx,
+                            animal_class,
+                            crop_history
+                        )
+                    )
+                total_saved += sum(f.result() for f in futures)
+
+        print(f"\n{video_name}: Сохранено {total_saved} объектов")
 
     except Exception as e:
-        print(f"⚠Ошибка детекции: {str(e)}")
-        return 0
+        print(f"Ошибка: {str(e)}")
+    finally:
+        cap.release()
 
 
 def process_all_jsons(json_root, video_root, output_root):
@@ -145,20 +250,18 @@ def process_all_jsons(json_root, video_root, output_root):
     # Инициализация и построение кеша
     cache = VideoCache()
     cache.build(video_root)
+    crop_history = CropHistory()
 
     json_files = []
     for root, _, files in os.walk(json_root):
         json_files.extend(os.path.join(root, f) for f in files if f.endswith('.json'))
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        list(tqdm(
-            executor.map(
-                lambda j: process_json(j, cache, output_root),
-                json_files
-            ),
-            total=len(json_files),
-            desc="Обработка JSON файлов"
-        ))
+        tasks = [executor.submit(process_json, jp, cache, output_root, crop_history)
+                 for jp in json_files]
+
+        for _ in tqdm(as_completed(tasks), total=len(tasks), desc="Обработка JSON файлов"):
+            pass
 
 
 if __name__ == "__main__":
